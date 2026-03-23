@@ -19,7 +19,8 @@ TARGET_NAMES = [
 @st.cache_resource
 def load_model():
     try:
-        model = joblib.load('rf_gearbox_model.pkl')
+        
+        model = joblib.load('rf_gearbox_model_small.pkl')
         scaler = joblib.load('feature_scaler.pkl')
         return model, scaler
     except FileNotFoundError:

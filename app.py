@@ -1,167 +1,154 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
+import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from scipy.signal import resample
 
-# ---------------------------------------------------------
-# PAGE CONFIG
-# ---------------------------------------------------------
-st.set_page_config(page_title="Vibration Fault Diagnosis", layout="wide")
-
-# ---------------------------------------------------------
-# LOAD RESOURCES
-# ---------------------------------------------------------
-@st.cache_resource
-def load_resources():
-    # 1. Load Model
-    with open('vibration_model.pkl', 'rb') as f:
-        model = pickle.load(f)
-    
-    # 2. Load Training History (For Line Graph)
-    try:
-        with open('training_history.pkl', 'rb') as f:
-            history = pickle.load(f)
-    except:
-        history = None
-        st.warning("training_history.pkl not found. Graphs may not display.")
-
-    # 3. Load Evaluation Data (For Confusion Matrix)
-    try:
-        with open('model_evaluation.pkl', 'rb') as f:
-            eval_data = pickle.load(f)
-    except:
-        eval_data = None
-        st.warning("model_evaluation.pkl not found. Graphs may not display.")
-
-    return model, history, eval_data
-
-model, history, eval_data = load_resources()
-
-# ---------------------------------------------------------
-# HELPER FUNCTIONS
-# ---------------------------------------------------------
-def extract_features(signal):
-    features = []
-    features.extend([
-        np.mean(signal), np.std(signal), np.max(signal), np.min(signal),
-        np.sqrt(np.mean(signal**2)), stats.skew(signal), stats.kurtosis(signal),
-        np.mean(np.abs(signal)), np.sum(signal**2),
-    ])
-    fft_vals = np.abs(np.fft.fft(signal))
-    freqs = np.fft.fftfreq(len(signal))
-    if len(fft_vals) > 2:
-        dominant_idx = np.argmax(fft_vals[1:len(fft_vals)//2]) + 1
-        features.extend([freqs[dominant_idx], np.sum(fft_vals), np.std(fft_vals)])
-    else:
-        features.extend([0, 0, 0])
-    return np.array(features)
-
-label_map = {
-    0: "Healthy", 1: "Planet crack (S1)", 2: "Ring Broken (S1)", 3: "Sun Chipped (S1)",
-    4: "Planet 75% (S2)", 5: "Ring Missing (S2)", 6: "Sun Chipped 2nd (S2)",
-    7: "Planet 2 Broken (S3)", 8: "Ring 2 Tooth (S3)", 9: "Sun 2 Taper (S3)"
-}
-target_names_full = [
+# --- CONFIGURATION (Must match Training Script) ---
+WINDOW_SIZE = 1000  # CRITICAL: Must match training window size
+TARGET_NAMES = [
     'Healthy', 'Planet crack (S1)', 'Ring Broken (S1)', 'Sun Chipped (S1)',
     'Planet 75% (S2)', 'Ring Missing (S2)', 'Sun Chipped 2nd (S2)',
     'Planet 2 Broken (S3)', 'Ring 2 Tooth (S3)', 'Sun 2 Taper (S3)'
 ]
 
-# ---------------------------------------------------------
-# SIDEBAR
-# ---------------------------------------------------------
-st.sidebar.title("Navigation")
+# --- LOAD ARTIFACTS ---
+@st.cache_resource
+def load_model():
+    try:
+        model = joblib.load('rf_gearbox_model.pkl')
+        scaler = joblib.load('feature_scaler.pkl')
+        return model, scaler
+    except FileNotFoundError:
+        st.error("Model files not found! Please run the training script first to generate 'rf_gearbox_model.pkl' and 'feature_scaler.pkl'")
+        return None, None
 
-# ---------------------------------------------------------
-# TABS
-# ---------------------------------------------------------
-tab1, tab2 = st.tabs(["🔍 Predict Fault", "📊 Model Analysis"])
+# --- FEATURE EXTRACTION (Exact Copy from Training) ---
+def extract_features(signal):
+    features = []
+    # Time Domain
+    features.extend([
+        np.mean(signal), np.std(signal), np.max(signal), np.min(signal),
+        np.sqrt(np.mean(signal**2)), stats.skew(signal), stats.kurtosis(signal),
+        np.mean(np.abs(signal)), np.sum(signal**2),
+    ])
+    # Frequency Domain
+    fft_vals = np.abs(np.fft.fft(signal))
+    freqs = np.fft.fftfreq(len(signal))
+    dominant_idx = np.argmax(fft_vals[1:len(fft_vals)//2]) + 1
+    features.append(freqs[dominant_idx])
+    features.append(np.sum(fft_vals))
+    features.append(np.std(fft_vals))
+    return np.array(features)
 
-# ==========================================
-# TAB 1: FAULT PREDICTION
-# ==========================================
-with tab1:
-    st.title("Gearbox Vibration Fault Diagnosis")
-    st.markdown("Upload a CSV vibration signal file to detect faults.")
+# --- MAIN APP ---
+st.set_page_config(page_title="Gearbox Fault Detector", layout="wide")
+st.title("🔧 Gearbox Fault Diagnosis System")
 
-    window_size = st.sidebar.slider("Analysis Window Size", 100, 5000, 1000)
-    uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
+model, scaler = load_model()
+if model is None:
+    st.stop()
 
-    if uploaded_file is not None:
+uploaded_file = st.file_uploader("Upload Vibration CSV File", type=["csv"])
+
+if uploaded_file is not None:
+    # 1. READ FILE ROBUSTLY
+    # Try to detect header. If the first few rows aren't numeric, skip them.
+    try:
+        # Attempt reading without header first to inspect
+        df_check = pd.read_csv(uploaded_file, nrows=5)
+        # Check if first column looks like a float
         try:
-            df = pd.read_csv(uploaded_file, header=2)
-            if df.shape[1] < 2:
-                st.error("CSV must have at least 2 columns.")
-            else:
-                signal = df.iloc[:, 1].values
-                if len(signal) >= window_size:
-                    signal_window = signal[:window_size]
-                else:
-                    signal_window = signal
-                
-                features = extract_features(signal_window)
-                prediction = model.predict([features])[0]
-                probability = model.predict_proba([features])[0]
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Predicted Class", label_map.get(prediction, "Unknown"))
-                with col2:
-                    health_index = probability[0] * 100
-                    st.metric("Health Index", f"{health_index:.2f}%")
+            float(df_check.iloc[0, 0])
+            # If it worked, read normally
+            uploaded_file.seek(0) # Reset pointer
+            df = pd.read_csv(uploaded_file, header=None)
+        except ValueError:
+            # If failed, assume header exists
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        st.stop()
 
-                st.write("---")
-                st.subheader("Prediction Probability")
-                prob_df = pd.DataFrame({'Fault Type': [label_map[i] for i in range(10)], 'Probability (%)': probability * 100})
-                st.bar_chart(prob_df.set_index('Fault Type'))
-                st.subheader("Signal Visualization")
-                st.line_chart(signal_window)
+    st.subheader("Raw Data Preview")
+    st.dataframe(df.head())
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+    # 2. SELECT SIGNAL COLUMN
+    # We assume user wants to analyze a specific column. Default to column 1 or 2 (index 1).
+    col_names = df.columns.tolist()
+    selected_col = st.selectbox("Select the Vibration/Amplitude Column", col_names, index=1 if len(col_names) > 1 else 0)
+    
+    signal_raw = df[selected_col].values
 
-# ==========================================
-# TAB 2: MODEL ANALYSIS (GRAPHS)
-# ==========================================
-with tab2:
-    st.title("Model Performance Analysis")
-    st.markdown("Visualizing training history and evaluation metrics.")
+    # Remove non-numeric values just in case
+    signal_clean = signal_raw[np.isfinite(signal_raw)]
 
-    if history is None or eval_data is None:
-        st.error("Required data files (training_history.pkl or model_evaluation.pkl) are missing from the repository.")
+    if len(signal_clean) < WINDOW_SIZE:
+        st.error(f"File too short! Need at least {WINDOW_SIZE} data points, got {len(signal_clean)}")
     else:
-        col_a, col_b = st.columns(2)
+        # 3. PRE-PROCESSING (THE FIX)
+        
+        # A. Resample to exactly 1000 points to match Training Window
+        # This ensures FFT features are calculated on the same basis
+        signal_resampled = resample(signal_clean, WINDOW_SIZE)
+        
+        # B. Normalize Amplitude (Z-score)
+        # This fixes the issue where your sensor outputs different voltage/units than training data
+        signal_normalized = (signal_resampled - np.mean(signal_resampled)) / (np.std(signal_resampled) + 1e-9)
 
-        # --- GRAPH 1: TRAINING VS TESTING ACCURACY ---
-        with col_a:
-            st.subheader("Learning Curve")
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.plot(history['iterations'], history['train_acc'], 'b-', label='Training Accuracy')
-            ax.plot(history['iterations'], history['test_acc'], 'r-', label='Test Accuracy')
-            ax.set_title('Random Forest: Training vs Test Accuracy')
-            ax.set_xlabel('Iterations (Number of Trees)')
-            ax.set_ylabel('Accuracy')
-            ax.legend()
-            ax.grid(True, linestyle='--', alpha=0.6)
+        # 4. EXTRACT FEATURES
+        features = extract_features(signal_normalized)
+        features_scaled = scaler.transform([features]) # Apply the saved scaler!
+
+        # 5. PREDICT
+        prediction_idx = model.predict(features_scaled)[0]
+        probabilities = model.predict_proba(features_scaled)[0]
+
+        # --- DISPLAY RESULTS ---
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Diagnosis Result")
+            result_name = TARGET_NAMES[prediction_idx]
+            
+            # Color coding
+            if prediction_idx == 0:
+                st.success(f"## ✅ {result_name}")
+            else:
+                st.error(f"## ⚠️ DETECTED FAULT: {result_name}")
+
+        with col2:
+            st.subheader("Model Confidence")
+            # Create a bar chart of probabilities
+            fig, ax = plt.subplots(figsize=(10, 6))
+            bars = ax.barh(TARGET_NAMES, probabilities * 100, color='skyblue')
+            ax.set_xlabel("Probability (%)")
+            ax.set_xlim(0, 100)
+            
+            # Highlight the winner
+            bars[prediction_idx].set_color('red' if prediction_idx != 0 else 'green')
+            
             st.pyplot(fig)
 
-        # --- GRAPH 2: CONFUSION MATRIX ---
-        with col_b:
-            st.subheader("Confusion Matrix")
-            cm = eval_data['confusion_matrix']
-            fig, ax = plt.subplots(figsize=(10, 8))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                        xticklabels=target_names_full, yticklabels=target_names_full,
-                        ax=ax, annot_kws={"size": 8})
-            ax.set_title('Confusion Matrix (Random Forest)')
-            ax.set_xlabel('Predicted Label')
-            ax.set_ylabel('True Label')
-            plt.xticks(rotation=45, ha='right')
-            plt.yticks(rotation=0)
-            st.pyplot(fig)
-
-        # --- ACCURACY TEXT SUMMARY ---
-        st.info(f"Final Training Accuracy: {history['train_acc'][-1]*100:.2f}% | Final Test Accuracy: {history['test_acc'][-1]*100:.2f}%")
+        # --- DEBUGGING INFO (To help you understand why) ---
+        with st.expander("🔍 Debug: Feature Analysis"):
+            st.write("**Extracted Features (Normalized):**")
+            feat_df = pd.DataFrame([features_scaled[0]], columns=[
+                'Mean', 'Std', 'Max', 'Min', 'RMS', 'Skew', 'Kurtosis',
+                'MAD', 'Energy', 'Dom_Freq', 'Spec_Energy', 'Spec_Std'
+            ])
+            st.dataframe(feat_df.T.rename(columns={0: 'Value'}))
+            
+            st.write("**Signal Visualization (Normalized):**")
+            fig2, ax2 = plt.subplots()
+            ax2.plot(signal_normalized, color='blue')
+            ax2.set_title("Normalized Signal Window (Used for Prediction)")
+            ax2.set_xlabel("Sample")
+            ax2.set_ylabel("Amplitude (Z-score)")
+            st.pyplot(fig2)
+            
+            st.info("💡 **Tip:** If 'Healthy' shows as a fault, check if your signal shape (skewness/kurtosis) is very different from the training data.")

@@ -21,7 +21,7 @@ TARGET_NAMES = [
 def load_model():
     try:
         # Load the model and scaler saved from your training script
-        model = joblib.load('rf_gearbox_model.pkl')
+        model = joblib.load('rf_gearbox_model_small.pkl')
         scaler = joblib.load('feature_scaler.pkl')
         return model, scaler
     except FileNotFoundError:
